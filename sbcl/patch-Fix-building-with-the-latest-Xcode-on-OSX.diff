@@ -1,0 +1,185 @@
+commit 2fd854b3b20fc95db33012b04d20dc27bdac0f91
+Author: Stas Boukarev <stassats@gmail.com>
+Date:   Mon Sep 19 16:31:58 2016 +0300
+
+    Fix building with the latest Xcode on OSX.
+    
+    It tried to allocate a port with a name that was a pointer to the
+    thread struct, but that pointer is not always accepted as a port name.
+    Use mach_port_allocate and associate the thread struct with it using
+    mach_port_set_context.
+    
+    Closes lp#1470996.
+
+diff --git a/src/runtime/darwin-os.c b/src/runtime/darwin-os.c
+index 3fd399e..02101fa 100644
+--- a/src/runtime/darwin-os.c
++++ b/src/runtime/darwin-os.c
+@@ -105,67 +105,6 @@ setup_mach_exception_handling_thread()
+     return mach_exception_handling_thread;
+ }
+ 
+-struct exception_port_record
+-{
+-    struct thread * thread;
+-    struct exception_port_record * next;
+-};
+-
+-static OSQueueHead free_records = OS_ATOMIC_QUEUE_INIT;
+-
+-/* We can't depend on arbitrary addresses to be accepted as mach port
+- * names, particularly not on 64-bit platforms.  Instead, we allocate
+- * records that point to the thread struct, and loop until one is accepted
+- * as a port name.
+- *
+- * Threads are mapped to exception ports with a slot in the thread struct,
+- * and exception ports are casted to records that point to the corresponding
+- * thread.
+- *
+- * The lock-free free-list above is used as a cheap fast path.
+- */
+-static mach_port_t
+-find_receive_port(struct thread * thread)
+-{
+-    mach_port_t ret;
+-    struct exception_port_record * curr, * to_free = NULL;
+-    unsigned long i;
+-    for (i = 1;; i++) {
+-        curr = OSAtomicDequeue(&free_records, offsetof(struct exception_port_record, next));
+-        if (curr == NULL) {
+-            curr = calloc(1, sizeof(struct exception_port_record));
+-            if (curr == NULL)
+-                lose("unable to allocate exception_port_record\n");
+-        }
+-#ifdef LISP_FEATURE_X86_64
+-        if ((mach_port_t)curr != (unsigned long)curr)
+-            goto skip;
+-#endif
+-
+-        if (mach_port_allocate_name(current_mach_task,
+-                                    MACH_PORT_RIGHT_RECEIVE,
+-                                    (mach_port_t)curr))
+-            goto skip;
+-        curr->thread = thread;
+-        ret = (mach_port_t)curr;
+-        break;
+-        skip:
+-        curr->next = to_free;
+-        to_free = curr;
+-        if ((i % 1024) == 0)
+-            FSHOW((stderr, "Looped %lu times trying to allocate an exception port\n"));
+-    }
+-    while (to_free != NULL) {
+-        struct exception_port_record * current = to_free;
+-        to_free = to_free->next;
+-        free(current);
+-    }
+-
+-    FSHOW((stderr, "Allocated exception port %x for thread %p\n", ret, thread));
+-
+-    return ret;
+-}
+-
+ /* tell the kernel that we want EXC_BAD_ACCESS exceptions sent to the
+    exception port (which is being listened to do by the mach
+    exception handling thread). */
+@@ -175,10 +114,18 @@ mach_lisp_thread_init(struct thread * thread)
+     kern_return_t ret;
+     mach_port_t current_mach_thread, thread_exception_port;
+ 
+-    /* allocate a named port for the thread */
+-    thread_exception_port
+-        = thread->mach_port_name
+-        = find_receive_port(thread);
++    if (mach_port_allocate(current_mach_task,
++                           MACH_PORT_RIGHT_RECEIVE,
++                           &thread_exception_port) != KERN_SUCCESS) {
++        lose("Cannot allocate thread_exception_port");
++    }
++
++    if (mach_port_set_context(current_mach_task, thread_exception_port,
++                              (mach_port_context_t)thread)
++        != KERN_SUCCESS) {
++        lose("Cannot set thread_exception_port context");
++    }
++    thread->mach_port_name = thread_exception_port;
+ 
+     /* establish the right for the thread_exception_port to send messages */
+     ret = mach_port_insert_right(current_mach_task,
+@@ -214,20 +161,21 @@ mach_lisp_thread_init(struct thread * thread)
+     return ret;
+ }
+ 
+-kern_return_t
++void
+ mach_lisp_thread_destroy(struct thread *thread) {
+-    kern_return_t ret;
+     mach_port_t port = thread->mach_port_name;
+     FSHOW((stderr, "Deallocating mach port %x\n", port));
+-    mach_port_move_member(current_mach_task, port, MACH_PORT_NULL);
+-    mach_port_deallocate(current_mach_task, port);
+-
+-    ret = mach_port_destroy(current_mach_task, port);
+-    ((struct exception_port_record*)(long)port)->thread = NULL;
+-    OSAtomicEnqueue(&free_records, (void*)(long)port,
+-                    offsetof(struct exception_port_record, next));
++    if (mach_port_move_member(current_mach_task, port, MACH_PORT_NULL)
++        != KERN_SUCCESS) {
++        lose("Error destroying an exception port");
++    }
++    if (mach_port_deallocate(current_mach_task, port) != KERN_SUCCESS) {
++        lose("Error destroying an exception port");
++    }
+ 
+-    return ret;
++    if (mach_port_destroy(current_mach_task, port) != KERN_SUCCESS) {
++        lose("Error destroying an exception port");
++    }
+ }
+ 
+ void
+diff --git a/src/runtime/thread.h b/src/runtime/thread.h
+index 2e3353a..adfea4f 100644
+--- a/src/runtime/thread.h
++++ b/src/runtime/thread.h
+@@ -324,7 +324,7 @@ static inline struct thread *arch_os_get_current_thread(void)
+ 
+ #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
+ extern kern_return_t mach_lisp_thread_init(struct thread *thread);
+-extern kern_return_t mach_lisp_thread_destroy(struct thread *thread);
++extern void mach_lisp_thread_destroy(struct thread *thread);
+ #endif
+ 
+ typedef struct init_thread_data {
+diff --git a/src/runtime/x86-64-darwin-os.c b/src/runtime/x86-64-darwin-os.c
+index 1eda6fb..6420cfa 100644
+--- a/src/runtime/x86-64-darwin-os.c
++++ b/src/runtime/x86-64-darwin-os.c
+@@ -309,7 +309,9 @@ catch_exception_raise(mach_port_t exception_port,
+     struct thread *th;
+ 
+     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
+-    th = *(struct thread**)(long)exception_port;
++    if (mach_port_get_context(mach_task_self(), exception_port, &th) != KERN_SUCCESS) {
++      lose("Can't find the thread for an exception %p", exception_port);
++    }
+ 
+     switch (exception) {
+ 
+diff --git a/src/runtime/x86-darwin-os.c b/src/runtime/x86-darwin-os.c
+index b0281ba..e14d384 100644
+--- a/src/runtime/x86-darwin-os.c
++++ b/src/runtime/x86-darwin-os.c
+@@ -383,7 +383,11 @@ catch_exception_raise(mach_port_t exception_port,
+     struct thread *th;
+ 
+     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
+-    th = *(struct thread**)exception_port;
++
++    if (mach_port_get_context(mach_task_self(), exception_port, &th) != KERN_SUCCESS) {
++      lose("Can't find the thread for an exception %p", exception_port);
++    }
++
+     /* Get state and info */
+     state_count = x86_THREAD_STATE32_COUNT;
+     if ((ret = thread_get_state(thread,
